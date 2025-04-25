@@ -7,18 +7,21 @@ import logging
 from dotenv import load_dotenv
 import os
 import calendar
+import uuid
+import asyncio
 
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_IDS = os.getenv('ADMIN_IDS', '').split(',')  # Comma-separated admin IDs from .env
 
+
 # Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Conversation states
-SELECT_DOCTOR, PATIENT_NAME, PATIENT_DOB, CAREGIVER_LINK, CANCEL_BOOKING, ADMIN_ADD, ADMIN_REMOVE, USER_EDIT, BROADCAST, ADMIN_ADD_SLOT, ADMIN_ADD_DOCTOR = range(11)
+SELECT_DOCTOR, PATIENT_NAME, PATIENT_DOB, CAREGIVER_LINK, CANCEL_BOOKING, ADMIN_ADD, ADMIN_REMOVE, USER_EDIT, BROADCAST, ADMIN_ADD_SLOT, ADMIN_ADD_DOCTOR, SUPPORT_REQUEST = range(12)
 
 # Booking tuple indices
 BOOKING_FIELDS = {
@@ -35,7 +38,8 @@ BOOKING_FIELDS = {
 # Initialize database
 def init_db():
     try:
-        conn = sqlite3.connect('doctomed.db')
+        conn = sqlite3.connect('doctomed.db', timeout=10)
+        conn.execute('PRAGMA journal_mode=WAL')  # Enable Write-Ahead Logging
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS bookings 
                      (id INTEGER PRIMARY KEY, user_id INTEGER, patient_name TEXT, 
@@ -49,6 +53,8 @@ def init_db():
                      (id INTEGER PRIMARY KEY, booking_date TEXT, time_slot TEXT, doctor_id INTEGER, is_available INTEGER)''')
         c.execute('''CREATE TABLE IF NOT EXISTS doctors 
                      (user_id INTEGER PRIMARY KEY, name TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS support_requests 
+                     (id INTEGER PRIMARY KEY, user_id INTEGER, message TEXT, timestamp TEXT, status TEXT)''')
         # Populate admins from ADMIN_IDS
         for admin_id in ADMIN_IDS:
             try:
@@ -67,8 +73,9 @@ TIME_SLOTS = ["09:00", "10:00", "11:00", "14:00", "15:00", "16:00"]
 
 # Check if user is admin
 def is_admin(user_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
     try:
-        conn = sqlite3.connect('doctomed.db')
         c = conn.cursor()
         c.execute('SELECT user_id FROM admins WHERE user_id = ?', (user_id,))
         result = c.fetchone()
@@ -81,8 +88,9 @@ def is_admin(user_id):
 
 # Get available doctor slots for a specific doctor
 def get_available_slots(doctor_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
     try:
-        conn = sqlite3.connect('doctomed.db')
         c = conn.cursor()
         today = date.today()
         end_date = today + timedelta(days=7)
@@ -106,8 +114,9 @@ def get_available_slots(doctor_id):
 
 # Get all doctors
 def get_all_doctors():
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
     try:
-        conn = sqlite3.connect('doctomed.db')
         c = conn.cursor()
         c.execute('SELECT user_id, name FROM doctors')
         doctors = c.fetchall()
@@ -118,121 +127,403 @@ def get_all_doctors():
     finally:
         conn.close()
 
+# Get doctor by ID
+def get_doctor_by_id(doctor_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT user_id, name FROM doctors WHERE user_id = ?', (doctor_id,))
+        doctor = c.fetchone()
+        return doctor
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching doctor {doctor_id}: {e}")
+        return None
+    finally:
+        conn.close()
+
+# Get user bookings
+def get_user_bookings(user_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT id, user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, status FROM bookings WHERE user_id = ? AND confirmed = 1', (user_id,))
+        bookings = c.fetchall()
+        return bookings
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching bookings for user {user_id}: {e}")
+        return []
+    finally:
+        conn.close()
+
+# Get all bookings
+def get_all_bookings():
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT id, user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, status FROM bookings WHERE confirmed = 1')
+        bookings = c.fetchall()
+        return bookings
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching all bookings: {e}")
+        return []
+    finally:
+        conn.close()
+
+# Get booking by ID
+def get_booking_by_id(booking_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT id, user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, status FROM bookings WHERE id = ?', (booking_id,))
+        booking = c.fetchone()
+        return booking
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching booking {booking_id}: {e}")
+        return None
+    finally:
+        conn.close()
+
+# Get all users
+def get_all_users():
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT user_id, is_caregiver, linked_patient FROM users')
+        users = c.fetchall()
+        return users
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching users: {e}")
+        return []
+    finally:
+        conn.close()
+
+# Get user by ID
+def get_user_by_id(user_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT user_id, is_caregiver, linked_patient FROM users WHERE user_id = ?', (user_id,))
+        user = c.fetchone()
+        return user
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching user {user_id}: {e}")
+        return None
+    finally:
+        conn.close()
+
+# Get available slots for all doctors
+def get_available_slots_for_all_doctors():
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        today = date.today()
+        end_date = today + timedelta(days=7)
+        c.execute('''SELECT ds.booking_date, ds.time_slot, d.name 
+                     FROM doctor_slots ds 
+                     JOIN doctors d ON ds.doctor_id = d.user_id
+                     WHERE ds.is_available = 1 
+                     AND ds.booking_date >= ? AND ds.booking_date <= ?
+                     ORDER BY ds.booking_date, ds.time_slot''', 
+                     (today.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')))
+        slots = c.fetchall()
+        return slots
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching all doctor slots: {e}")
+        return []
+    finally:
+        conn.close()
+
+# Delete user
+def delete_user(user_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+        c.execute('UPDATE bookings SET confirmed = 0 WHERE user_id = ?', (user_id,))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Error deleting user {user_id}: {e}")
+    finally:
+        conn.close()
+
+# Get all admins
+def get_all_admins():
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT user_id FROM admins')
+        admins = c.fetchall()
+        return admins
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching admins: {e}")
+        return []
+    finally:
+        conn.close()
+
+# Add admin
+def add_admin(admin_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (admin_id,))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Error adding admin {admin_id}: {e}")
+    finally:
+        conn.close()
+
+# Remove admin
+def remove_admin(admin_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('DELETE FROM admins WHERE user_id = ?', (admin_id,))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Error removing admin {admin_id}: {e}")
+    finally:
+        conn.close()
+
+# Cancel booking
+def cancel_booking(booking_id):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT booking_date, time_slot, doctor_id, status, confirmed, patient_name, user_id FROM bookings WHERE id = ?', (booking_id,))
+        booking = c.fetchone()
+        if not booking:
+            logger.error(f"Booking ID {booking_id} not found")
+            return False, "Booking not found."
+        if booking[4] == 0 or booking[3] == 'cancelled':
+            logger.warning(f"Booking ID {booking_id} is already cancelled")
+            return False, "Booking is already cancelled."
+        
+        c.execute('UPDATE bookings SET confirmed = 0, status = ? WHERE id = ?', ('cancelled', booking_id))
+        c.execute('UPDATE doctor_slots SET is_available = 1 WHERE booking_date = ? AND time_slot = ? AND doctor_id = ?',
+                  (booking[0], booking[1], booking[2]))
+        conn.commit()
+        return True, booking
+    except sqlite3.Error as e:
+        logger.error(f"Error cancelling booking {booking_id}: {e}")
+        return False, str(e)
+    finally:
+        conn.close()
+
+# Log support request
+def log_support_request(user_id, message):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        c.execute('INSERT INTO support_requests (user_id, message, timestamp, status) VALUES (?, ?, ?, ?)',
+                  (user_id, message, timestamp, 'open'))
+        conn.commit()
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"Error logging support request for user {user_id}: {e}")
+        return False
+    finally:
+        conn.close()
+
+# Get system stats
+def get_system_stats():
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM bookings WHERE confirmed = 1')
+        total_bookings = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM users')
+        active_users = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM admins')
+        total_admins = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM doctors')
+        total_doctors = c.fetchone()[0]
+        return {
+            'total_bookings': total_bookings,
+            'active_users': active_users,
+            'total_admins': total_admins,
+            'total_doctors': total_doctors
+        }
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching system stats: {e}")
+        return {'total_bookings': 0, 'active_users': 0, 'total_admins': 0, 'total_doctors': 0}
+    finally:
+        conn.close()
+
+# Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"User {user_id} started the bot")
     context.user_data.clear()  # Reset state on /start
-    if is_admin(user_id):
-        keyboard = [
-            [InlineKeyboardButton("Admin Panel", callback_data='admin_panel')],
-            [InlineKeyboardButton("Access User Features", callback_data='user_mode')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        welcome_message = (
-            "👋 Welcome, Admin! Access the Admin Panel to manage the Doctomed Call Service.\n"
-            "You can also switch to user features if needed."
-        )
-    else:
-        keyboard = [
-            [InlineKeyboardButton("Book Now", callback_data='book')],
-            [InlineKeyboardButton("Cancel Booking", callback_data='cancel_booking')],
-            [InlineKeyboardButton("Service Info", callback_data='info')],
-            [InlineKeyboardButton("Contact Support", callback_data='support')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        welcome_message = (
-            "👋 Welcome to Doctomed Call Service – professional care over the phone.\n"
-            "📞 This service uses a Swiss premium number: 0900 123 456\n"
-            "Would you like to book a call?"
-        )
-    
     try:
+        if is_admin(user_id):
+            keyboard = [
+                [InlineKeyboardButton("Admin Panel", callback_data='admin_panel')],
+                [InlineKeyboardButton("Access User Features", callback_data='user_mode')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            welcome_message = (
+                "👋 Welcome, Admin! Access the Admin Panel to manage the Doctomed Call Service.\n"
+                "You can also switch to user features if needed."
+            )
+        else:
+            keyboard = [
+                [InlineKeyboardButton("Book Now", callback_data='book')],
+                [InlineKeyboardButton("Cancel Booking", callback_data='cancel_booking')],
+                [InlineKeyboardButton("Service Info", callback_data='info')],
+                [InlineKeyboardButton("Contact Support", callback_data='support')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            welcome_message = (
+                "👋 Welcome to Doctomed Call Service – professional care over the phone.\n"
+                "📞 This service uses a Swiss premium number: 0900 0900 90\n"
+                "Would you like to book a call?"
+            )
         await update.message.reply_text(welcome_message, reply_markup=reply_markup)
     except Exception as e:
-        logger.error(f"Error sending start message to user {user_id}: {e}")
+        logger.error(f"Error sending start message to user {user_id}: {e}", exc_info=True)
         await update.message.reply_text("⚠️ An error occurred. Please try again or contact support.")
 
-async def select_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doctors = get_all_doctors()
-    if not doctors:
-        logger.warning("No doctors available in the database")
-        await update.callback_query.message.reply_text("⚠️ No doctors available. Please contact support.")
-        return ConversationHandler.END
-    
-    keyboard = [[InlineKeyboardButton(f"{doctor[1]}", callback_data=f'doctor_{doctor[0]}')] for doctor in doctors]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+# Cancel command
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    logger.info(f"User {user_id} issued /cancel command")
+    context.user_data.clear()  # Reset conversation state
     try:
+        await update.message.reply_text("✅ Conversation reset. Use /start to begin again.")
+    except Exception as e:
+        logger.error(f"Error sending cancel response to user {user_id}: {e}")
+    return ConversationHandler.END
+
+# Health check command
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        try:
+            await update.message.reply_text("⚠️ Unauthorized access.")
+        except Exception as e:
+            logger.error(f"Error sending unauthorized message to user {user_id}: {e}")
+        return
+    try:
+        stats = get_system_stats()
+        conn = sqlite3.connect('doctomed.db', timeout=10)
+        conn.close()
+        health_status = "✅ Database: Connected\n"
+        health_status += f"📊 Total Bookings: {stats['total_bookings']}\n"
+        health_status += f"👥 Active Users: {stats['active_users']}\n"
+        health_status += f"👨‍⚕️ Doctors: {stats['total_doctors']}\n"
+        await update.message.reply_text(health_status)
+    except Exception as e:
+        logger.error(f"Health check failed for user {user_id}: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"⚠️ Health check failed: {e}")
+        except Exception as reply_error:
+            logger.error(f"Failed to send health check error to user {user_id}: {reply_error}")
+
+# Select doctor
+async def select_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        doctors = get_all_doctors()
+        if not doctors:
+            logger.warning("No doctors available in the database")
+            await update.callback_query.message.reply_text("⚠️ No doctors available. Please contact support.")
+            return ConversationHandler.END
+        
+        keyboard = [[InlineKeyboardButton(f"{doctor[1]}", callback_data=f'doctor_{doctor[0]}')] for doctor in doctors]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         await update.callback_query.message.reply_text(
             "👨‍⚕️ Please select a doctor to view their schedule:",
             reply_markup=reply_markup
         )
     except Exception as e:
-        logger.error(f"Error sending doctor selection to user {update.effective_user.id}: {e}")
-        await update.callback_query.message.reply_text("⚠️ An error occurred. Please try again.")
+        logger.error(f"Error sending doctor selection to user {update.effective_user.id}: {e}", exc_info=True)
+        try:
+            await update.callback_query.message.reply_text("⚠️ An error occurred. Please try again or use /start to reset.")
+        except Exception as reply_error:
+            logger.error(f"Failed to send error message to user {update.effective_user.id}: {reply_error}")
+        context.user_data.clear()
+        return ConversationHandler.END
     return SELECT_DOCTOR
 
+# Show calendar
 async def show_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE, doctor_id):
-    doctor = get_doctor_by_id(doctor_id)
-    if not doctor:
-        logger.warning(f"Doctor {doctor_id} not found")
-        await update.callback_query.message.reply_text("⚠️ Doctor not found.")
-        return ConversationHandler.END
-    
-    available_slots = get_available_slots(doctor_id)
-    if not available_slots:
-        logger.info(f"No available slots for doctor {doctor_id}")
-        await update.callback_query.message.reply_text(
-            f"⚠️ No available slots for {doctor[1]}. Please try another doctor or contact support."
-        )
-        return ConversationHandler.END
-    
-    # Group slots by date
-    slots_by_date = {}
-    for slot in available_slots:
-        booking_date = slot[0]
-        if booking_date not in slots_by_date:
-            slots_by_date[booking_date] = []
-        slots_by_date[booking_date].append(slot[1])
-    
-    # Create calendar message
-    message = f"📅 {doctor[1]}'s Schedule (Next 7 Days)\n\n"
-    for booking_date in sorted(slots_by_date.keys()):
-        booking_date_dt = datetime.strptime(booking_date, '%Y-%m-%d')
-        day_name = calendar.day_name[booking_date_dt.weekday()]
-        message += f"🗓️ {booking_date} ({day_name})\n"
-        for time_slot in sorted(slots_by_date[booking_date]):
-            message += f"- {time_slot} ✅\n"
-        message += "\n"
-    
-    # Create inline keyboard for slots
-    keyboard = []
-    for booking_date in sorted(slots_by_date.keys()):
-        for time_slot in sorted(slots_by_date[booking_date]):
-            callback_data = f"slot_{time_slot}_{booking_date}_{doctor_id}"
-            keyboard.append([InlineKeyboardButton(time_slot, callback_data=callback_data)])
-    keyboard.append([InlineKeyboardButton("Back to Doctors", callback_data='select_doctor')])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     try:
+        doctor = get_doctor_by_id(doctor_id)
+        if not doctor:
+            logger.warning(f"Doctor {doctor_id} not found")
+            await update.callback_query.message.reply_text("⚠️ Doctor not found.")
+            return ConversationHandler.END
+        
+        available_slots = get_available_slots(doctor_id)
+        if not available_slots:
+            logger.info(f"No available slots for doctor {doctor_id}")
+            await update.callback_query.message.reply_text(
+                f"⚠️ No available slots for {doctor[1]}. Please try another doctor or contact support."
+            )
+            return ConversationHandler.END
+        
+        slots_by_date = {}
+        for slot in available_slots:
+            booking_date = slot[0]
+            if booking_date not in slots_by_date:
+                slots_by_date[booking_date] = []
+            slots_by_date[booking_date].append(slot[1])
+        
+        message = f"📅 {doctor[1]}'s Schedule (Next 7 Days)\n\n"
+        for booking_date in sorted(slots_by_date.keys()):
+            booking_date_dt = datetime.strptime(booking_date, '%Y-%m-%d')
+            day_name = calendar.day_name[booking_date_dt.weekday()]
+            message += f"🗓️ {booking_date} ({day_name})\n"
+            for time_slot in sorted(slots_by_date[booking_date]):
+                message += f"- {time_slot} ✅\n"
+            message += "\n"
+        
+        keyboard = []
+        for booking_date in sorted(slots_by_date.keys()):
+            for time_slot in sorted(slots_by_date[booking_date]):
+                callback_data = f"slot_{time_slot}_{booking_date}_{doctor_id}"
+                keyboard.append([InlineKeyboardButton(time_slot, callback_data=callback_data)])
+        keyboard.append([InlineKeyboardButton("Back to Doctors", callback_data='select_doctor')])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await update.callback_query.message.reply_text(
             message + "Select a slot to book:",
             reply_markup=reply_markup
         )
     except Exception as e:
-        logger.error(f"Error sending calendar for doctor {doctor_id}: {e}")
-        await update.callback_query.message.reply_text("⚠️ An error occurred. Please try again.")
+        logger.error(f"Error sending calendar for doctor {doctor_id} to user {update.effective_user.id}: {e}", exc_info=True)
+        try:
+            await update.callback_query.message.reply_text("⚠️ An error occurred. Please try again or use /start to reset.")
+        except Exception as reply_error:
+            logger.error(f"Failed to send error message to user {update.effective_user.id}: {reply_error}")
+        context.user_data.clear()
+        return ConversationHandler.END
     return SELECT_DOCTOR
 
+# Button callback
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
-    is_user_admin = is_admin(user_id)
     logger.info(f"User {user_id} triggered callback: {query.data}")
     
     try:
-        # Handle user mode toggle for admins
+        is_user_admin = is_admin(user_id)
         if query.data == 'user_mode' and is_user_admin:
             keyboard = [
                 [InlineKeyboardButton("Book Now", callback_data='book')],
@@ -247,9 +538,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup
             )
             return
-
-        # User features
-        if query.data == 'book' and not (is_user_admin and 'admin_panel' in query.data):
+        elif query.data == 'book' and not (is_user_admin and 'admin_panel' in query.data):
             await select_doctor(update, context)
             return SELECT_DOCTOR
         elif query.data == 'select_doctor' and not (is_user_admin and 'admin_panel' in query.data):
@@ -277,20 +566,47 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Select a booking to cancel:", reply_markup=reply_markup)
         elif query.data.startswith('cancel_') and not (is_user_admin and 'admin_panel' in query.data):
             booking_id = int(query.data.split('_')[1])
-            cancel_booking(booking_id)
-            await query.message.reply_text("✅ Booking cancelled successfully.")
+            success, result = cancel_booking(booking_id)
+            if success:
+                booking = result
+                await query.message.reply_text(
+                    f"✅ Booking for {booking[5]} on {booking[0]} at {booking[1]} cancelled successfully."
+                )
+                try:
+                    doctor = get_doctor_by_id(booking[2])
+                    doctor_name = doctor[1] if doctor else "Doctor"
+                    await context.bot.send_message(
+                        chat_id=booking[2],
+                        text=(
+                            f"🔔 Booking cancelled:\n"
+                            f"Patient: {booking[5]}\n"
+                            f"Date: {booking[0]}\n"
+                            f"Time: {booking[1]}"
+                        )
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify doctor ID {booking[2]} about cancellation: {e}")
+                    await query.message.reply_text("⚠️ Booking cancelled, but failed to notify the doctor.")
+            else:
+                await query.message.reply_text(f"⚠️ Failed to cancel booking: {result}")
         elif query.data == 'info' and not (is_user_admin and 'admin_panel' in query.data):
+            doctors = get_all_doctors()
+            doctor_list = "\n".join([f"- {doctor[1]}" for doctor in doctors]) if doctors else "No doctors available at the moment."
             await query.message.reply_text(
-                "ℹ️ Doctomed provides professional medical consultations via phone.\n"
-                "Available: Mon-Fri, 9:00-17:00\n"
-                "Our doctors are Swiss-certified and provide quality care."
+                "ℹ️ *Doctomed Call Service*\n\n"
+                "We provide professional medical consultations via phone using a Swiss premium number: *0900 0900 90*.\n\n"
+                "🕒 *Availability*: Monday to Friday, 9:00–17:00\n"
+                "👨‍⚕️ *Our Doctors*:\n" + doctor_list + "\n\n"
+                "🌐 Visit our website: https://doctomed.ch\n"
+                "All our doctors are Swiss-certified, ensuring high-quality care."
             )
         elif query.data == 'support' and not (is_user_admin and 'admin_panel' in query.data):
+            context.user_data['state'] = SUPPORT_REQUEST
             await query.message.reply_text(
-                "📧 For support, contact us at support@doctomed.ch or call +41 44 123 45 67"
+                "📧 Please describe your issue or question, and our support team will get back to you.\n"
+                "You can also contact us at support@doctomed.ch or call +41 44 123 45 67."
             )
-
-        # Admin features
+            return SUPPORT_REQUEST
         elif query.data == 'admin_panel' and is_user_admin:
             keyboard = [
                 [
@@ -350,8 +666,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         elif query.data.startswith('admin_cancel_') and is_user_admin:
             booking_id = int(query.data.split('_')[2])
-            cancel_booking(booking_id)
-            await query.message.reply_text(f"✅ Booking ID {booking_id} cancelled.")
+            success, result = cancel_booking(booking_id)
+            if success:
+                await query.message.reply_text(f"✅ Booking ID {booking_id} cancelled.")
+            else:
+                await query.message.reply_text(f"⚠️ Failed to cancel booking: {result}")
         elif query.data == 'admin_users' and is_user_admin:
             users = get_all_users()
             if not users:
@@ -477,12 +796,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return PATIENT_NAME
         elif query.data == 'book_self' and not (is_user_admin and 'admin_panel' in query.data):
-            conn = sqlite3.connect('doctomed.db')
-            c = conn.cursor()
-            c.execute('INSERT OR REPLACE INTO users (user_id, is_caregiver, linked_patient) VALUES (?, ?, ?)',
-                      (user_id, 0, None))
-            conn.commit()
-            conn.close()
+            conn = sqlite3.connect('doctomed.db', timeout=10)
+            conn.execute('PRAGMA journal_mode=WAL')
+            try:
+                c = conn.cursor()
+                c.execute('INSERT OR REPLACE INTO users (user_id, is_caregiver, linked_patient) VALUES (?, ?, ?)',
+                          (user_id, 0, None))
+                conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Error registering user {user_id} as self: {e}")
+                await query.message.reply_text("⚠️ Error registering user. Please try again.")
+                return
+            finally:
+                conn.close()
             await select_doctor(update, context)
             return SELECT_DOCTOR
         elif query.data == 'book_caregiver' and not (is_user_admin and 'admin_panel' in query.data):
@@ -497,18 +823,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not booking:
                 await query.message.reply_text("⚠️ Booking not found.")
                 return
-            conn = sqlite3.connect('doctomed.db')
-            c = conn.cursor()
-            c.execute('UPDATE bookings SET status = ?, confirmed = 1 WHERE id = ?', ('approved', booking_id))
-            c.execute('UPDATE doctor_slots SET is_available = 0 WHERE booking_date = ? AND time_slot = ? AND doctor_id = ?',
-                      (booking[BOOKING_FIELDS['booking_date']], booking[BOOKING_FIELDS['time_slot']], booking[BOOKING_FIELDS['doctor_id']]))
-            conn.commit()
-            conn.close()
-            # Get doctor name
+            conn = sqlite3.connect('doctomed.db', timeout=10)
+            conn.execute('PRAGMA journal_mode=WAL')
+            try:
+                c = conn.cursor()
+                c.execute('UPDATE bookings SET status = ?, confirmed = 1 WHERE id = ?', ('approved', booking_id))
+                c.execute('UPDATE doctor_slots SET is_available = 0 WHERE booking_date = ? AND time_slot = ? AND doctor_id = ?',
+                          (booking[BOOKING_FIELDS['booking_date']], booking[BOOKING_FIELDS['time_slot']], booking[BOOKING_FIELDS['doctor_id']]))
+                conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Error approving booking {booking_id}: {e}")
+                await query.message.reply_text("⚠️ Error approving booking. Please try again.")
+                return
+            finally:
+                conn.close()
             doctor = get_doctor_by_id(booking[BOOKING_FIELDS['doctor_id']])
             doctor_name = doctor[1] if doctor else "Doctor"
-            # Notify user
-            booking_date = str(booking[BOOKING_FIELDS['booking_date']]) if isinstance(booking[BOOKING_FIELDS['booking_date']], int) else booking[BOOKING_FIELDS['booking_date']]
+            booking_date = str(booking[BOOKING_FIELDS['booking_date']])
             try:
                 booking_date_dt = datetime.strptime(booking_date, '%Y-%m-%d')
             except ValueError as e:
@@ -518,21 +849,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             day_name = calendar.day_name[booking_date_dt.weekday()]
             current_date = date.today().strftime('%Y-%m-%d')
             date_display = "today" if booking[BOOKING_FIELDS['booking_date']] == current_date else f"on {booking[BOOKING_FIELDS['booking_date']]} ({day_name})"
-            await context.bot.send_message(
-                chat_id=booking[BOOKING_FIELDS['user_id']],
-                text=(
-                    f"✅ Your call with {doctor_name} is scheduled {date_display} at {booking[BOOKING_FIELDS['time_slot']]}. "
-                    "Please call 0900 123 456 at that time."
+            try:
+                await context.bot.send_message(
+                    chat_id=booking[BOOKING_FIELDS['user_id']],
+                    text=(
+                        f"✅ Your call with {doctor_name} is scheduled {date_display} at {booking[BOOKING_FIELDS['time_slot']]}. "
+                        "Please call 0900 0900 90 at that time."
+                    )
                 )
-            )
-            # Notify doctor
-            await context.bot.send_message(
-                chat_id=booking[BOOKING_FIELDS['doctor_id']],
-                text=(
-                    f"✅ Booking confirmed for {booking[BOOKING_FIELDS['patient_name']]} on {booking[BOOKING_FIELDS['booking_date']]} ({day_name}) at {booking[BOOKING_FIELDS['time_slot']]}. "
-                    f"Patient: {booking[BOOKING_FIELDS['patient_name']]}\nDOB: {booking[BOOKING_FIELDS['patient_dob']]}\nUser ID: {booking[BOOKING_FIELDS['user_id']]}"
+            except Exception as e:
+                logger.error(f"Failed to notify user {booking[BOOKING_FIELDS['user_id']]} about approval: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=booking[BOOKING_FIELDS['doctor_id']],
+                    text=(
+                        f"✅ Booking confirmed for {booking[BOOKING_FIELDS['patient_name']]} on {booking[BOOKING_FIELDS['booking_date']]} ({day_name}) at {booking[BOOKING_FIELDS['time_slot']]}. "
+                        f"Patient: {booking[BOOKING_FIELDS['patient_name']]}\nDOB: {booking[BOOKING_FIELDS['patient_dob']]}\nUser ID: {booking[BOOKING_FIELDS['user_id']]}"
+                    )
                 )
-            )
+            except Exception as e:
+                logger.error(f"Failed to notify doctor {booking[BOOKING_FIELDS['doctor_id']]} about approval: {e}")
             await query.message.reply_text(f"✅ Booking ID {booking_id} approved. User and doctor notified.")
         elif query.data.startswith('reject_booking_'):
             booking_id = int(query.data.split('_')[2])
@@ -540,208 +876,50 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not booking:
                 await query.message.reply_text("⚠️ Booking not found.")
                 return
-            conn = sqlite3.connect('doctomed.db')
-            c = conn.cursor()
-            c.execute('UPDATE bookings SET status = ?, confirmed = 0 WHERE id = ?', ('rejected', booking_id))
-            conn.commit()
-            conn.close()
-            # Notify user
-            await context.bot.send_message(
-                chat_id=booking[BOOKING_FIELDS['user_id']],
-                text=f"❌ Your booking for {booking[BOOKING_FIELDS['patient_name']]} on {booking[BOOKING_FIELDS['booking_date']]} at {booking[BOOKING_FIELDS['time_slot']]} was rejected by the doctor. Please select another slot."
-            )
+            conn = sqlite3.connect('doctomed.db', timeout=10)
+            conn.execute('PRAGMA journal_mode=WAL')
+            try:
+                c = conn.cursor()
+                c.execute('UPDATE bookings SET status = ?, confirmed = 0 WHERE id = ?', ('rejected', booking_id))
+                conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Error rejecting booking {booking_id}: {e}")
+                await query.message.reply_text("⚠️ Error rejecting booking. Please try again.")
+                return
+            finally:
+                conn.close()
+            try:
+                await context.bot.send_message(
+                    chat_id=booking[BOOKING_FIELDS['user_id']],
+                    text=f"❌ Your booking for {booking[BOOKING_FIELDS['patient_name']]} on {booking[BOOKING_FIELDS['booking_date']]} at {booking[BOOKING_FIELDS['time_slot']]} was rejected by the doctor. Please select another slot."
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user {booking[BOOKING_FIELDS['user_id']]} about rejection: {e}")
             await query.message.reply_text(f"✅ Booking ID {booking_id} rejected. User notified.")
         else:
-            await query.message.reply_text("⚠️ You don't have permission to access this feature.")
+            await query.message.reply_text("⚠️ Invalid action. Please use the provided buttons.")
     except Exception as e:
-        logger.error(f"Error in button_callback for user {user_id}, callback {query.data}: {e}, booking data: {locals().get('booking', 'N/A')}")
-        await query.message.reply_text("⚠️ An error occurred. Please try again or contact support.")
+        if "429" in str(e):
+            logger.warning(f"Rate limit exceeded for user {user_id}: {e}")
+            try:
+                await query.message.reply_text("⚠️ Bot is temporarily rate-limited. Please try again in a moment.")
+            except Exception as reply_error:
+                logger.error(f"Failed to send rate limit message to user {user_id}: {reply_error}")
+            return
+        logger.error(f"Error in button_callback for user {user_id}, callback {query.data}: {e}", exc_info=True)
+        try:
+            await query.message.reply_text("⚠️ An error occurred. Please try again or use /start to reset.")
+        except Exception as reply_error:
+            logger.error(f"Failed to send error message to user {user_id}: {reply_error}")
+        context.user_data.clear()
+        return
 
-def get_user_bookings(user_id):
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('SELECT id, user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, status FROM bookings WHERE user_id = ? AND confirmed = 1', (user_id,))
-        bookings = c.fetchall()
-        return bookings
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching bookings for user {user_id}: {e}")
-        return []
-    finally:
-        conn.close()
-
-def get_all_bookings():
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('SELECT id, user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, status FROM bookings WHERE confirmed = 1')
-        bookings = c.fetchall()
-        return bookings
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching all bookings: {e}")
-        return []
-    finally:
-        conn.close()
-
-def get_booking_by_id(booking_id):
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('SELECT id, user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, status FROM bookings WHERE id = ?', (booking_id,))
-        booking = c.fetchone()
-        return booking
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching booking {booking_id}: {e}")
-        return None
-    finally:
-        conn.close()
-
-def get_all_users():
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('SELECT user_id, is_caregiver, linked_patient FROM users')
-        users = c.fetchall()
-        return users
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching users: {e}")
-        return []
-    finally:
-        conn.close()
-
-def get_user_by_id(user_id):
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('SELECT user_id, is_caregiver, linked_patient FROM users WHERE user_id = ?', (user_id,))
-        user = c.fetchone()
-        return user
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching user {user_id}: {e}")
-        return None
-    finally:
-        conn.close()
-
-def get_doctor_by_id(doctor_id):
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('SELECT user_id, name FROM doctors WHERE user_id = ?', (doctor_id,))
-        doctor = c.fetchone()
-        return doctor
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching doctor {doctor_id}: {e}")
-        return None
-    finally:
-        conn.close()
-
-def get_available_slots_for_all_doctors():
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        today = date.today()
-        end_date = today + timedelta(days=7)
-        c.execute('''SELECT ds.booking_date, ds.time_slot, d.name 
-                     FROM doctor_slots ds 
-                     JOIN doctors d ON ds.doctor_id = d.user_id
-                     WHERE ds.is_available = 1 
-                     AND ds.booking_date >= ? AND ds.booking_date <= ?
-                     ORDER BY ds.booking_date, ds.time_slot''', 
-                     (today.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')))
-        slots = c.fetchall()
-        return slots
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching all doctor slots: {e}")
-        return []
-    finally:
-        conn.close()
-
-def delete_user(user_id):
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
-        c.execute('UPDATE bookings SET confirmed = 0 WHERE user_id = ?', (user_id,))
-        conn.commit()
-    except sqlite3.Error as e:
-        logger.error(f"Error deleting user {user_id}: {e}")
-    finally:
-        conn.close()
-
-def get_all_admins():
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('SELECT user_id FROM admins')
-        admins = c.fetchall()
-        return admins
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching admins: {e}")
-        return []
-    finally:
-        conn.close()
-
-def add_admin(admin_id):
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (admin_id,))
-        conn.commit()
-    except sqlite3.Error as e:
-        logger.error(f"Error adding admin {admin_id}: {e}")
-    finally:
-        conn.close()
-
-def remove_admin(admin_id):
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('DELETE FROM admins WHERE user_id = ?', (admin_id,))
-        conn.commit()
-    except sqlite3.Error as e:
-        logger.error(f"Error removing admin {admin_id}: {e}")
-    finally:
-        conn.close()
-
-def cancel_booking(booking_id):
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('UPDATE bookings SET confirmed = 0, status = ? WHERE id = ?', ('cancelled', booking_id))
-        conn.commit()
-    except sqlite3.Error as e:
-        logger.error(f"Error cancelling booking {booking_id}: {e}")
-    finally:
-        conn.close()
-
-def get_system_stats():
-    try:
-        conn = sqlite3.connect('doctomed.db')
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM bookings WHERE confirmed = 1')
-        total_bookings = c.fetchone()[0]
-        c.execute('SELECT COUNT(*) FROM users')
-        active_users = c.fetchone()[0]
-        c.execute('SELECT COUNT(*) FROM admins')
-        total_admins = c.fetchone()[0]
-        c.execute('SELECT COUNT(*) FROM doctors')
-        total_doctors = c.fetchone()[0]
-        return {
-            'total_bookings': total_bookings,
-            'active_users': active_users,
-            'total_admins': total_admins,
-            'total_doctors': total_doctors
-        }
-    except sqlite3.Error as e:
-        logger.error(f"Error fetching system stats: {e}")
-        return {'total_bookings': 0, 'active_users': 0, 'total_admins': 0, 'total_doctors': 0}
-    finally:
-        conn.close()
-
+# Handle booking start
 async def handle_booking_start(query, context):
     user_id = query.from_user.id
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
     try:
-        conn = sqlite3.connect('doctomed.db')
         c = conn.cursor()
         c.execute('SELECT is_caregiver FROM users WHERE user_id = ?', (user_id,))
         user = c.fetchone()
@@ -759,14 +937,21 @@ async def handle_booking_start(query, context):
         await select_doctor(query, context)
         return SELECT_DOCTOR
     except Exception as e:
-        logger.error(f"Error in handle_booking_start for user {user_id}: {e}")
-        await query.message.reply_text("⚠️ An error occurred. Please try again.")
+        logger.error(f"Error in handle_booking_start for user {user_id}: {e}", exc_info=True)
+        try:
+            await query.message.reply_text("⚠️ An error occurred. Please try again or use /start to reset.")
+        except Exception as reply_error:
+            logger.error(f"Failed to send error message to user {user_id}: {reply_error}")
+        context.user_data.clear()
+        return
     finally:
         conn.close()
 
+# Get doctor ID by name
 def get_doctor_id_by_name(name):
+    conn = sqlite3.connect('doctomed.db', timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
     try:
-        conn = sqlite3.connect('doctomed.db')
         c = conn.cursor()
         c.execute('SELECT user_id FROM doctors WHERE name = ?', (name,))
         doctor = c.fetchone()
@@ -777,27 +962,34 @@ def get_doctor_id_by_name(name):
     finally:
         conn.close()
 
+# Handle message
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     text = update.message.text
-    is_user_admin = is_admin(user_id)
     logger.info(f"User {user_id} sent message: {text}, state: {context.user_data.get('state')}")
     
     try:
+        is_user_admin = is_admin(user_id)
         if context.user_data.get('state') == CAREGIVER_LINK and not is_user_admin:
-            conn = sqlite3.connect('doctomed.db')
-            c = conn.cursor()
-            c.execute('INSERT OR REPLACE INTO users (user_id, is_caregiver, linked_patient) VALUES (?, ?, ?)',
-                      (user_id, 1, text))
-            conn.commit()
-            conn.close()
+            conn = sqlite3.connect('doctomed.db', timeout=10)
+            conn.execute('PRAGMA journal_mode=WAL')
+            try:
+                c = conn.cursor()
+                c.execute('INSERT OR REPLACE INTO users (user_id, is_caregiver, linked_patient) VALUES (?, ?, ?)',
+                          (user_id, 1, text))
+                conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Error registering caregiver for user {user_id}: {e}")
+                await update.message.reply_text("⚠️ Error registering caregiver. Please try again.")
+                return ConversationHandler.END
+            finally:
+                conn.close()
             context.user_data.pop('state', None)
             await update.message.reply_text(
                 f"✅ Registered as caregiver for {text}. You can now book calls on their behalf."
             )
             await select_doctor(update, context)
             return SELECT_DOCTOR
-        
         elif context.user_data.get('state') == PATIENT_NAME and not is_user_admin:
             context.user_data['patient_name'] = text
             context.user_data['state'] = PATIENT_DOB
@@ -805,7 +997,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "📅 Please provide the patient's date of birth (format: YYYY-MM-DD, e.g., 1980-01-01)."
             )
             return PATIENT_DOB
-        
         elif context.user_data.get('state') == PATIENT_DOB and not is_user_admin:
             try:
                 patient_dob = datetime.strptime(text, '%Y-%m-%d').strftime('%Y-%m-%d')
@@ -814,7 +1005,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 booking_date = context.user_data['selected_date']
                 doctor_id = context.user_data['selected_doctor_id']
                 
-                # Validate booking_date
                 try:
                     datetime.strptime(booking_date, '%Y-%m-%d')
                 except ValueError:
@@ -823,28 +1013,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     context.user_data.clear()
                     return ConversationHandler.END
                 
-                # Verify slot is still available
-                conn = sqlite3.connect('doctomed.db')
-                c = conn.cursor()
-                c.execute('SELECT is_available FROM doctor_slots WHERE booking_date = ? AND time_slot = ? AND doctor_id = ?', 
-                          (booking_date, time_slot, doctor_id))
-                slot = c.fetchone()
-                if not slot or slot[0] == 0:
-                    await update.message.reply_text("⚠️ This slot is no longer available. Please select another slot.")
+                conn = sqlite3.connect('doctomed.db', timeout=10)
+                conn.execute('PRAGMA journal_mode=WAL')
+                try:
+                    c = conn.cursor()
+                    c.execute('SELECT is_available FROM doctor_slots WHERE booking_date = ? AND time_slot = ? AND doctor_id = ?', 
+                              (booking_date, time_slot, doctor_id))
+                    slot = c.fetchone()
+                    if not slot or slot[0] == 0:
+                        await update.message.reply_text("⚠️ This slot is no longer available. Please select another slot.")
+                        context.user_data.clear()
+                        return ConversationHandler.END
+                    
+                    c.execute('INSERT INTO bookings (user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, status, confirmed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                              (user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, 'pending', 0))
+                    booking_id = c.lastrowid
+                    conn.commit()
+                except sqlite3.Error as e:
+                    logger.error(f"Error inserting booking for user {user_id}: {e}")
+                    await update.message.reply_text("⚠️ Error creating booking. Please try again.")
                     context.user_data.clear()
                     return ConversationHandler.END
+                finally:
+                    conn.close()
                 
-                # Insert pending booking
-                c.execute('INSERT INTO bookings (user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, status, confirmed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                          (user_id, patient_name, patient_dob, time_slot, booking_date, doctor_id, 'pending', 0))
-                booking_id = c.lastrowid
-                conn.commit()
-                conn.close()
-                
-                # Get user's Telegram username
                 username = update.message.from_user.username or "N/A"
-                
-                # Notify doctor
                 booking_date_dt = datetime.strptime(booking_date, '%Y-%m-%d')
                 day_name = calendar.day_name[booking_date_dt.weekday()]
                 try:
@@ -874,15 +1067,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     elif "blocked" in str(e).lower():
                         user_message = "⚠️ Bot is blocked by the doctor. Please contact the doctor to unblock the bot."
                     await update.message.reply_text(user_message)
-                    # Notify admins
                     for admin_id in ADMIN_IDS:
                         try:
                             await context.bot.send_message(
                                 chat_id=int(admin_id),
                                 text=f"⚠️ Notification error for booking ID {booking_id}: {error_message}"
                             )
-                        except:
-                            pass
+                            await asyncio.sleep(0.1)  # Rate limit delay
+                        except Exception as admin_error:
+                            logger.error(f"Failed to notify admin {admin_id}: {admin_error}")
                     context.user_data.clear()
                     return ConversationHandler.END
                 
@@ -896,12 +1089,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except ValueError:
                 await update.message.reply_text("Invalid date format. Please use YYYY-MM-DD (e.g., 1980-01-01).")
                 return PATIENT_DOB
-            except Exception as e:
-                logger.error(f"Error processing booking for user {user_id}: {e}")
-                await update.message.reply_text("⚠️ An error occurred during booking. Please try again.")
-                context.user_data.clear()
-                return ConversationHandler.END
-        
         elif context.user_data.get('state') == ADMIN_ADD and is_user_admin:
             try:
                 new_admin_id = int(text)
@@ -911,26 +1098,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("Please enter a valid Telegram User ID.")
             context.user_data.pop('state', None)
             return ConversationHandler.END
-        
         elif context.user_data.get('state') == USER_EDIT and is_user_admin:
             try:
                 edit_user_id = context.user_data['edit_user_id']
                 is_caregiver, linked_patient = text.split(',')
                 is_caregiver = int(is_caregiver.strip())
                 linked_patient = linked_patient.strip() or None
-                conn = sqlite3.connect('doctomed.db')
-                c = conn.cursor()
-                c.execute('UPDATE users SET is_caregiver = ?, linked_patient = ? WHERE user_id = ?',
-                          (is_caregiver, linked_patient, edit_user_id))
-                conn.commit()
-                conn.close()
+                conn = sqlite3.connect('doctomed.db', timeout=10)
+                conn.execute('PRAGMA journal_mode=WAL')
+                try:
+                    c = conn.cursor()
+                    c.execute('UPDATE users SET is_caregiver = ?, linked_patient = ? WHERE user_id = ?',
+                              (is_caregiver, linked_patient, edit_user_id))
+                    conn.commit()
+                except sqlite3.Error as e:
+                    logger.error(f"Error updating user {edit_user_id}: {e}")
+                    await update.message.reply_text("⚠️ Error updating user. Please try again.")
+                    return ConversationHandler.END
+                finally:
+                    conn.close()
                 await update.message.reply_text(f"✅ User ID {edit_user_id} updated.")
             except ValueError:
                 await update.message.reply_text("Invalid format. Use: is_caregiver,linked_patient (e.g., 1,John Doe)")
             context.user_data.pop('state', None)
             context.user_data.pop('edit_user_id', None)
             return ConversationHandler.END
-        
         elif context.user_data.get('state') == BROADCAST and is_user_admin:
             users = get_all_users()
             success_count = 0
@@ -939,6 +1131,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 try:
                     await context.bot.send_message(chat_id=user[0], text=f"📢 Announcement: {text}")
                     success_count += 1
+                    await asyncio.sleep(0.1)  # Rate limit delay
                 except Exception as e:
                     logger.error(f"Failed to send broadcast to User ID {user[0]}: {e}")
                     failure_count += 1
@@ -948,7 +1141,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             context.user_data.pop('state', None)
             return ConversationHandler.END
-        
         elif context.user_data.get('state') == ADMIN_ADD_SLOT and is_user_admin:
             try:
                 booking_date, time_slot, doctor_id = text.split(',')
@@ -958,52 +1150,98 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 datetime.strptime(booking_date, '%Y-%m-%d')
                 if time_slot not in TIME_SLOTS:
                     raise ValueError
-                conn = sqlite3.connect('doctomed.db')
-                c = conn.cursor()
-                c.execute('SELECT user_id FROM doctors WHERE user_id = ?', (doctor_id,))
-                if not c.fetchone():
-                    raise ValueError
-                c.execute('INSERT OR IGNORE INTO doctor_slots (booking_date, time_slot, doctor_id, is_available) VALUES (?, ?, ?, ?)',
-                          (booking_date, time_slot, doctor_id, 1))
-                conn.commit()
-                conn.close()
+                conn = sqlite3.connect('doctomed.db', timeout=10)
+                conn.execute('PRAGMA journal_mode=WAL')
+                try:
+                    c = conn.cursor()
+                    c.execute('SELECT user_id FROM doctors WHERE user_id = ?', (doctor_id,))
+                    if not c.fetchone():
+                        raise ValueError
+                    c.execute('INSERT OR IGNORE INTO doctor_slots (booking_date, time_slot, doctor_id, is_available) VALUES (?, ?, ?, ?)',
+                              (booking_date, time_slot, doctor_id, 1))
+                    conn.commit()
+                except ValueError:
+                    await update.message.reply_text("Invalid doctor ID or format. Please check and try again.")
+                    return ADMIN_ADD_SLOT
+                except sqlite3.Error as e:
+                    logger.error(f"Error adding doctor slot: {e}")
+                    await update.message.reply_text("⚠️ Error adding slot. Please try again.")
+                    return ConversationHandler.END
+                finally:
+                    conn.close()
                 await update.message.reply_text(f"✅ Doctor slot added: {booking_date}, {time_slot} for Doctor ID {doctor_id}")
             except ValueError:
                 await update.message.reply_text("Invalid format. Use: date,time_slot,doctor_id (e.g., 2025-04-23,09:00,987654321)")
-            except Exception as e:
-                logger.error(f"Error adding doctor slot: {e}")
-                await update.message.reply_text("⚠️ An error occurred. Please try again.")
+                return ADMIN_ADD_SLOT
             context.user_data.pop('state', None)
             return ConversationHandler.END
-        
         elif context.user_data.get('state') == ADMIN_ADD_DOCTOR and is_user_admin:
             try:
                 user_id, name = text.split(',')
                 user_id = int(user_id.strip())
                 name = name.strip()
-                conn = sqlite3.connect('doctomed.db')
-                c = conn.cursor()
-                c.execute('INSERT OR IGNORE INTO doctors (user_id, name) VALUES (?, ?)', (user_id, name))
-                conn.commit()
-                conn.close()
+                conn = sqlite3.connect('doctomed.db', timeout=10)
+                conn.execute('PRAGMA journal_mode=WAL')
+                try:
+                    c = conn.cursor()
+                    c.execute('INSERT OR IGNORE INTO doctors (user_id, name) VALUES (?, ?)', (user_id, name))
+                    conn.commit()
+                except sqlite3.Error as e:
+                    logger.error(f"Error adding doctor: {e}")
+                    await update.message.reply_text("⚠️ Error adding doctor. Please try again.")
+                    return ConversationHandler.END
+                finally:
+                    conn.close()
                 await update.message.reply_text(f"✅ Doctor added: {name} (ID: {user_id})")
             except ValueError:
                 await update.message.reply_text("Invalid format. Use: user_id,name (e.g., 987654321,Dr. Martin)")
-            except Exception as e:
-                logger.error(f"Error adding doctor: {e}")
-                await update.message.reply_text("⚠️ An error occurred. Please try again.")
+                return ADMIN_ADD_DOCTOR
             context.user_data.pop('state', None)
             return ConversationHandler.END
-        
+        elif context.user_data.get('state') == SUPPORT_REQUEST and not is_user_admin:
+            if log_support_request(user_id, text):
+                for admin_id in ADMIN_IDS:
+                    try:
+                        username = update.message.from_user.username or "N/A"
+                        await context.bot.send_message(
+                            chat_id=int(admin_id),
+                            text=(
+                                f"🔔 New support request from User ID {user_id} (Username: {username}):\n"
+                                f"Message: {text}"
+                            )
+                        )
+                        await asyncio.sleep(0.1)  # Rate limit delay
+                    except Exception as e:
+                        logger.error(f"Failed to notify admin ID {admin_id} about support request: {e}")
+                await update.message.reply_text(
+                    "✅ Your support request has been submitted. Our team will contact you soon."
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Failed to submit your support request. Please try again or contact support@doctomed.ch."
+                )
+            context.user_data.pop('state', None)
+            return ConversationHandler.END
         else:
             await update.message.reply_text("⚠️ Please use the provided buttons or commands.")
             return ConversationHandler.END
     except Exception as e:
-        logger.error(f"Error in handle_message for user {user_id}, text: {text}: {e}")
-        await update.message.reply_text("⚠️ An error occurred. Please try again or contact support.")
+        if "429" in str(e):
+            logger.warning(f"Rate limit exceeded for user {user_id}: {e}")
+            try:
+                await update.message.reply_text("⚠️ Bot is temporarily rate-limited. Please try again in a moment.")
+            except Exception as reply_error:
+                logger.error(f"Failed to send rate limit message to user {user_id}: {reply_error}")
+            return ConversationHandler.END
+        logger.error(f"Error in handle_message for user {user_id}, text: {text}: {e}", exc_info=True)
+        try:
+            await update.message.reply_text("⚠️ An error occurred. Please try again or use /start to reset.")
+        except Exception as reply_error:
+            logger.error(f"Failed to send error message to user {user_id}: {reply_error}")
         context.user_data.clear()
         return ConversationHandler.END
 
+# Main function
 def main():
     init_db()
     
@@ -1030,17 +1268,23 @@ def main():
                 BROADCAST: [MessageHandler(Text() & ~COMMAND, handle_message)],
                 ADMIN_ADD_SLOT: [MessageHandler(Text() & ~COMMAND, handle_message)],
                 ADMIN_ADD_DOCTOR: [MessageHandler(Text() & ~COMMAND, handle_message)],
+                SUPPORT_REQUEST: [MessageHandler(Text() & ~COMMAND, handle_message)],
             },
-            fallbacks=[CommandHandler('start', start)]
+            fallbacks=[
+                CommandHandler('start', start),
+                CommandHandler('cancel', cancel)
+            ]
         )
         
         application.add_handler(CommandHandler('start', start))
+        application.add_handler(CommandHandler('cancel', cancel))
+        application.add_handler(CommandHandler('health', health))
         application.add_handler(conv_handler)
         
         logger.info("Starting bot polling")
-        application.run_polling()
+        application.run_polling(poll_interval=1.0, timeout=10)
     except Exception as e:
-        logger.error(f"Error starting bot: {e}")
+        logger.error(f"Error starting bot: {e}", exc_info=True)
 
 if __name__ == '__main__':
     main()
