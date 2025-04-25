@@ -1,8 +1,5 @@
-# Core dependencies for running the bot
 python-telegram-bot==20.7
+aiosqlite==0.20.0
+aiologger==0.7.0
 python-dotenv==1.0.1
-
-# Optional: Development dependency for linting
-# pylint==3.2.7
-# Optional: for SMS reminders
-# twilio==8.11.0
+asyncio==3.4.3
